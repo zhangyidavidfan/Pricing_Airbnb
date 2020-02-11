@@ -1,0 +1,585 @@
+---
+title: "STAT_471_Final"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Processing
+
+```{r cars}
+#Load in all pacakges
+library(readr)
+library(stringr)
+library(syuzhet)
+library(dplyr)
+#Upon verification this should be the price per night
+Airbnb_data = read_csv("train.csv")
+```
+
+```{r}
+#Unpack all Amenities from List
+Amendities = unique(gsub(gsub(unlist(str_split(Airbnb_data$amenities,",")),pattern = '[[:punct:]]+',replacement = ''),pattern = " ",replacement = " "))
+```
+
+```{r}
+#Break Amenities list into one hot encoded columns
+Airbnb_data_ohe = cbind(Airbnb_data,sapply(Amendities, function(x){
+grepl(x,Airbnb_data$amenities)
+}
+))
+```
+
+```{r}
+#Extract Amenities actual price
+Airbnb_data_ohe$actual_price = exp(Airbnb_data_ohe$log_price) 
+```
+
+```{r}
+#Preliminary sentiment and word length extraction for title and sentiment
+Airbnb_data_ohe$title_length = nchar(Airbnb_data_ohe$name)
+Airbnb_data_ohe$descrip_length = nchar(Airbnb_data_ohe$description)
+Airbnb_data_ohe$title_caps = str_detect(Airbnb_data_ohe$name,pattern = "[A-Z][A-Z][A-Z]")
+Airbnb_data_ohe$title_sentiment = get_sentiment(Airbnb_data_ohe$name)
+Airbnb_data_ohe$desc_sentiment = get_sentiment(Airbnb_data_ohe$description)
+```
+
+```{r}
+# Text and word mining
+library(tm)
+mycorpus1 <- VCorpus( VectorSource(Airbnb_data_ohe$description))
+
+mycorpus_clean <- tm_map(mycorpus1, content_transformer(tolower))
+mycorpus_clean <- tm_map(mycorpus_clean, removeWords, stopwords("english"))
+mycorpus_clean <- tm_map(mycorpus_clean, removePunctuation)
+mycorpus_clean <- tm_map(mycorpus_clean, removeNumbers)
+mycorpus_clean <- tm_map(mycorpus_clean, stemDocument, lazy = TRUE)
+
+dtm1 = DocumentTermMatrix(mycorpus_clean)
+dtm1
+
+dt2 = removeSparseTerms(x = dtm1,0.90)
+```
+
+```{r}
+#Append word based columns
+Airbnb_data_ohe =cbind(Airbnb_data_ohe,as.matrix(dt2))
+```
+
+```{r}
+#Extract appropriate column names
+words = colnames(Airbnb_data_ohe[,167:297])
+
+location = c("city","neighbourhood")
+
+physical_features = c("property_type","room_type","bathrooms","bed_type","bedrooms","beds","accommodates",Amendities)
+physical_features = physical_features[-87]
+
+user_decided_features = c("title_length","descrip_length","title_caps","title_sentiment","desc_sentiment","instant_bookable","host_response_rate","host_has_profile_pic","host_identity_verified","cleaning_fee","cancellation_policy")
+```
+
+```{r}
+#Don't include the following features
+user_characteristic = c("first_review","host_since","last_review")
+customer_decided_features = c("number_of_reviews","review_scores_rating")
+```
+
+```{r}
+#Partial target variable
+target = c("actual_price")
+```
+
+```{r}
+#Extract property date for visualization
+cleaned = Airbnb_data_ohe[,c("log_price","latitude","longitude","first_review")]
+cleaned$property_date = ifelse(is.na(cleaned$first_review),Airbnb_data_ohe$host_since,cleaned$first_review) 
+cleaned$property_date = as.POSIXct(as.Date(cleaned$property_date,origin = "1970-01-01"))
+write.csv(cleaned,"cleaned.csv")
+```
+
+```{r}
+#Filter 0 dollar listing
+Airbnb_data_ohe = Airbnb_data_ohe %>% dplyr::filter(log_price != 0)
+```
+
+```{r}
+#Clear out trasnformed column
+Airbnb_data_filtered = Airbnb_data_ohe %>% select(-amenities,-description,-name,-thumbnail_url,-zipcode,-V80,-id,-log_price,-latitude,-longitude)
+```
+
+```{r}
+#Shift varible type for host response rate
+Airbnb_data_filtered$host_response_rate = as.integer(gsub(Airbnb_data_filtered$host_response_rate,pattern = "%",replacement = ""))
+```
+
+## Feature Engineering
+
+```{r}
+#Extract usable physical feature for the listings
+usable_physical_feature = physical_features[c(3,5:137)][which(sapply(Airbnb_data_filtered[,physical_features[c(3,5:137)]],function(x) var(x,na.rm = T)) != 0)]
+```
+
+```{r}
+#Mean imputation for NA
+Airbnb_physical_features = Airbnb_data_filtered[,c("property_type","room_type","bed_type",usable_physical_feature)]
+Airbnb_physical_features = fastDummies::dummy_cols(Airbnb_physical_features)[4:157]
+
+Airbnb_physical_features$bathrooms[is.na(Airbnb_physical_features$bathrooms)] = mean(Airbnb_physical_features$bathrooms,na.rm = T)
+Airbnb_physical_features$bedrooms[is.na(Airbnb_physical_features$bedrooms)] = mean(Airbnb_physical_features$bedrooms,na.rm = T)
+Airbnb_physical_features$beds[is.na(Airbnb_physical_features$beds)] = mean(Airbnb_physical_features$beds,na.rm = T)
+Airbnb_physical_features$accommodates[is.na(Airbnb_physical_features$accommodates)] = mean(Airbnb_physical_features$accommodates,na.rm = T)
+
+#Extract PCA for physical features
+physical_airbnb = prcomp(scale(Airbnb_physical_features), center = TRUE)
+```
+
+```{r}
+#PCA Summary
+summary(physical_airbnb)
+```
+
+```{r fig.height=5}
+#Visualize PCA
+PCA_cleaned = as.data.frame(physical_airbnb$rotation[,1:6])
+PCA_cleaned$variable = rownames(PCA_cleaned)
+library(ggplot2)
+ggplot(tidyr::gather(PCA_cleaned,"var","key",-variable), aes(x = variable, y = key)) + geom_col() + facet_wrap(~var,nrow = 10) + theme(axis.text.x = element_text(angle = 90,size = 3))
+```
+
+```{r}
+#Cooking
+physical_airbnb$rotation[,1][order(desc(abs(physical_airbnb$rotation[,1])))][1:8]
+```
+
+```{r}
+#Number of Accomodation and Basic Utility (Laundry)
+physical_airbnb$rotation[,2][order(desc(abs(physical_airbnb$rotation[,2])))][1:8]
+```
+
+```{r}
+#Bath and Toiletries (Negative - must multiple by -1)
+physical_airbnb$rotation[,3][order(desc(abs(physical_airbnb$rotation[,3])))][1:8]
+```
+
+```{r}
+#Comfort and Spaciousness
+physical_airbnb$rotation[,4][order(desc(abs(physical_airbnb$rotation[,4])))][1:8]
+```
+
+```{r}
+#Ease of access + gym
+physical_airbnb$rotation[,5][order(desc(abs(physical_airbnb$rotation[,5])))][1:8]
+```
+
+```{r}
+#Privacy (negative)
+physical_airbnb$rotation[,6][order(desc(abs(physical_airbnb$rotation[,6])))][1:8]
+```
+
+```{r}
+#Some must haves
+tidyr::gather(Airbnb_physical_features %>% summarise_all(function(x) abs(sum(x)/n())) %>% select(5:154)) %>% arrange(desc(value))
+```
+
+```{r}
+#Subset user feature based dataframe
+Airbnb_data_user_based = fastDummies::dummy_cols(Airbnb_data_filtered[,user_decided_features])[,c(1:10,12:16)]
+```
+
+```{r warning = F}
+#Are people valuing things differently through the years or is this simply a macro trend change likely due to supply and demand, Due to lack of sample, we will focus on 2015-2018
+ggplot(Airbnb_data_filtered %>% filter(number_of_reviews >= 3) %>% group_by(last_review_year = as.integer(format(as.Date(last_review),"%Y")),last_review_month = as.integer(format(as.Date(last_review),"%m"))) %>% summarise(price = mean(actual_price),count = n()) %>% mutate(date = last_review_year + last_review_month/12), aes(x = date, y = price,size = count)) + geom_point(color = "gold2") + geom_smooth(method = 'loess', formula= 'y ~ x', color = "indianred1") + theme_light() 
+```
+
+```{r}
+#PCA on words
+PCA_words = prcomp(Airbnb_data_ohe[,words])
+summary(PCA_words)
+```
+
+```{r}
+#Room Based Description (Negative)
+PCA_words$rotation[,1][order(desc(abs(PCA_words$rotation[,1])))][1:8]
+```
+
+```{r}
+#Location Based Description
+PCA_words$rotation[,2][order(desc(abs(PCA_words$rotation[,2])))][1:8]
+```
+
+```{r}
+#Some must haves
+descriptive = words[c(2,13,16,32,35,41,54,55,57,72,88,94,97,106,126)]
+```
+
+```{r}
+#PC1 - 6: physical feature; 3 Neg, 6 Neg
+#Userbased feature as is
+#Location
+#PC1 - 2: words and decriptive; 1:Neg (Depending on time - may use full vocab)
+#Combine all transformation
+
+Full_airbnb = Airbnb_data_user_based
+Full_airbnb = cbind(cbind(Full_airbnb,physical_airbnb$x[,c(1:2,4:5)]),(physical_airbnb$x[,c(3,6)] * -1))
+Full_airbnb = cbind(Full_airbnb, Airbnb_data_filtered[,location])
+Full_airbnb = cbind(cbind(Full_airbnb,PCA_words$x[,1]),(PCA_words$x[,2] * -1))
+Full_airbnb$descriptive_words = rowSums(Airbnb_data_ohe[,descriptive])
+```
+
+```{r}
+#Rename Column
+colnames(Full_airbnb) = c(colnames(Full_airbnb)[1:15],"Cooking","Size_and_basics","Comfort_and_space","Ease_of_access","Bath_and_Toiletries","Privacy",colnames(Full_airbnb)[22:23],"Room_based_words","Location_based_words","descriptive_words")
+```
+
+```{r}
+#Extract log pricw
+Full_airbnb = cbind(Full_airbnb,log(Airbnb_data_ohe[,target]))
+colnames(Full_airbnb)[27] = "log_price"
+```
+
+```{r}
+#Missing value imputation
+Full_airbnb %>% summarise_all(function(x) sum(is.na(x)))
+Full_airbnb[is.na(Full_airbnb$host_response_rate),]$host_response_rate = 0
+Full_airbnb[is.na(Full_airbnb$host_has_profile_pic),]$host_has_profile_pic = F
+Full_airbnb[is.na(Full_airbnb$host_identity_verified),]$host_identity_verified = F
+Full_airbnb[is.na(Full_airbnb$neighbourhood),]$neighbourhood = "NA"
+```
+
+```{r}
+#Extract last and first reviews
+set.seed(471)
+Full_airbnb$last_review = Airbnb_data_ohe$last_review
+Full_airbnb$first_review = Airbnb_data_ohe$first_review
+```
+
+```{r}
+#PFeature engineer listing since
+Full_airbnb = Full_airbnb %>% arrange(first_review) %>% group_by(neighbourhood) %>% mutate(ones = 1) %>% mutate(region_count = cumsum(ones))
+Full_airbnb = Full_airbnb %>% select(-ones,-first_review,-last_review)
+```
+
+```{r}
+#Extract Longitude and Latitude
+Full_airbnb$long = Airbnb_data_ohe$longitude
+Full_airbnb$lat  = Airbnb_data_ohe$latitude
+unique(Full_airbnb$city)
+
+# DC 38.8977° N, 77.0365° W (WHITE HOUSE)
+# NYC 40.7527° N, 73.9772° W (GRAND CENTRAL)
+# SF 37.7946° N, 122.3999° W (FINANCIAL DISTRICT)
+# BOS 42.3557° N, 71.0572° W (DOWNTOWN)
+# LA 34.0687° N, 118.3228° W (CENTRAL LA)
+# Chicago 41.8786° N, 87.6251° W (THE LOOP)
+
+#Extract distance to city center
+city_base = data.frame("city"= c("DC","NYC","SF","Boston","LA","Chicago"),"c_lat" = c(38.8977,40.7527,37.7946,42.3557,34.0687,41.8786),"c_lon" = c(77.0365,73.9772,122.3999,71.0572,118.3228,87.6251)*-1)
+
+Full_airbnb$dist_to_center = unlist(merge(Full_airbnb,city_base,on = "city") %>% mutate(dist = sqrt((long - c_lon)^2 + (lat - c_lat)^2)) %>% select(dist))
+Full_airbnb = Full_airbnb %>% select(-long,-lat)
+```
+
+```{r}
+#Keep holdout dataset with listing that has less than 3 reviews
+Holdouts = Full_airbnb[Airbnb_data_ohe$number_of_reviews < 3,]
+Full_airbnb = Full_airbnb[Airbnb_data_ohe$number_of_reviews >= 3,] 
+```
+
+```{r}
+#Keep expanded dataset
+Airbnb_full = Airbnb_data_ohe[,c(physical_features,user_decided_features,location,words)]
+Airbnb_expanded = fastDummies::dummy_cols(Airbnb_full)
+Full_Airbnb_expanded = Airbnb_expanded[,!sapply(Airbnb_expanded, is.character)]
+```
+
+
+#Visualization
+
+```{r}
+#Viz 1: User feature correlation plot
+corrplot::corrplot(cor(cbind(Full_airbnb[,colnames(Airbnb_data_user_based)],Full_airbnb$log_price),use = "complete.obs"),tl.cex = 0.3,tl.col = "grey1",method = "color",col=colorRampPalette(c("gold2","white","indianred1"))(200))
+```
+
+```{r}
+#Physical PC Viz
+ggplot(tidyr::gather(Full_airbnb[,c("Cooking","Size_and_basics","Comfort_and_space","Ease_of_access","Bath_and_Toiletries","Privacy","log_price")],"form","value",-log_price) %>% filter(value < 600), aes(x = value,y=log_price)) + geom_jitter(alpha = 1, color = "gold2",size = 0.005) + geom_smooth(method = "gam",se = T,color = "indianred1") + facet_wrap(~form,scales = "free_x") + theme_light()
+```
+
+```{r}
+#Descriptive PC Viz
+ggplot(tidyr::gather(Full_airbnb[,c("Room_based_words","Location_based_words","descriptive_words","log_price")],"form","value",-log_price) %>% filter(value < 600), aes(x = value,y=log_price)) + geom_jitter(alpha = 1, color = "gold2",size = 0.005) + geom_smooth(method = "lm",se = T,color = "indianred1") + facet_wrap(~form,scales = "free_x") + theme_light()
+```
+
+
+```{r}
+#Final Train Validation split
+set.seed(1)
+test_index = sample(nrow(Full_airbnb),5000)
+Full_airbnb = Full_airbnb %>% filter(log_price != 0)
+Full_airbnb_test = Full_airbnb[test_index,]
+Full_airbnb_train = Full_airbnb[-test_index,]
+Full_airbnb_expanded_test = Full_Airbnb_expanded[test_index,]
+Full_airbnb_expanded_train = Full_Airbnb_expanded[-test_index,]
+```
+
+#Modelling
+
+```{r}
+#General Lm modelling
+summary(lm(log_price~.-neighbourhood,Full_airbnb))
+```
+```{r}
+#F test on neughborhood information
+physical = lm(log_price~dist_to_center + region_count + city + Cooking + Size_and_basics + Comfort_and_space + Ease_of_access + Bath_and_Toiletries+ Privacy ,Full_airbnb)
+anova(lm(log_price~.-neighbourhood,Full_airbnb),physical)
+```
+
+```{r}
+#Construct per year regression to understand changing trnedd
+property_years = ifelse(is.na(format(Airbnb_data_ohe$last_review,"%Y")),format(Airbnb_data_ohe$host_since,"%Y"),format(Airbnb_data_ohe$last_review,"%Y"))
+
+coef_frame = data.frame()
+
+for(year in 2014:2017){
+  temp = as.data.frame(coef(summary(lm(log_price~.-neighbourhood,Full_airbnb[property_years == year,]))))
+  temp$year = year
+  temp$variable = rownames(temp)
+  coef_frame = rbind(coef_frame,temp)
+}
+
+coef_frame
+```
+
+
+```{r fig.width = 8}
+#Visualize changing trends
+ggplot(coef_frame %>% group_by(variable) %>% mutate(over_all_p = mean(`Pr(>|t|)`)) %>% filter(over_all_p < 0.05) %>% arrange(variable), aes(x = year, y = Estimate, fill = as.factor(year),alpha = 1-abs(`Pr(>|t|)`))) + geom_point(size = 3, color = "gold2") + geom_errorbar(aes(ymin = Estimate - `Std. Error`, ymax = Estimate + `Std. Error`, color = "indianred1"),width = 0.2) + geom_line(group = year,alpha = 0.3) + theme(axis.text.x = element_text(angle = 90)) + facet_wrap(~variable, scales = "free_y")  + theme_light()
+```
+
+
+```{r}
+#Variable transformation for Lasso
+target_mod = Full_airbnb_train$log_price
+train_set = model.matrix(object = log_price~.-neighbourhood + dist_to_center*city, data = Full_airbnb_train)
+dim(train_set)
+```
+
+```{r}
+#Lasso implementation
+library(glmnet)
+glmnet = cv.glmnet(y = target_mod, x = train_set)
+plot(glmnet)
+```
+
+```{r}
+#Lasso Selection
+rownames(coef(glmnet,s = "lambda.1se"))[which(coef(glmnet,s = "lambda.1se") != 0)]
+```
+
+```{r}
+#Relaxed Lasso
+relaxed_lasso = lm(log_price ~ title_length + title_caps + instant_bookable + title_sentiment+host_response_rate + host_identity_verified + cleaning_fee + cancellation_policy_strict + cancellation_policy_super_strict_30 + cancellation_policy_super_strict_60 + Cooking + Size_and_basics + Comfort_and_space + Privacy +Bath_and_Toiletries + city + Room_based_words + Location_based_words + descriptive_words, data = Full_airbnb_train)
+```
+
+```{r}
+#Summary for relaxed lasso
+summary(relaxed_lasso)
+#R-square 0.4
+```
+
+
+```{r}
+#Performance
+sqrt(mean((exp(predict(relaxed_lasso,Full_airbnb_test)) - exp(Full_airbnb_test$log_price))^2))
+mean(abs(exp(predict(relaxed_lasso,Full_airbnb_test)) - exp(Full_airbnb_test$log_price)))
+```
+
+```{r}
+#RF
+#Tune mtry : 14
+set.seed(1)
+rf.error.p <- c()
+for(p in seq(3,15,1))
+  {fit.rf <-ranger::ranger(log_price ~ .-neighbourhood, Full_airbnb_train, mtry=p, num.trees =100)
+  rf.error.p <- c(rf.error.p,fit.rf$prediction.error)
+}
+
+seq(3,15,1)[which.min(rf.error.p)]
+rf.error.p
+plot(seq(3,15,1),rf.error.p)
+```
+
+```{r}
+set.seed(1)
+#Tune ntree :450
+rf.error.nt <- c()
+for(nt in seq(50,500,50))
+  {fit.rf <-ranger::ranger(log_price ~ .-neighbourhood, Full_airbnb_train, mtry=14, num.trees =nt)
+  rf.error.nt <- c(rf.error.nt,fit.rf$prediction.error)
+}
+
+rf.error.nt
+seq(50,500,50)[which.min(rf.error.nt)]
+plot(seq(50,500,50),rf.error.nt)
+```
+
+```{r}
+#Fit full
+library(ranger)
+tree_mod = ranger(log_price ~ .-neighbourhood, data = Full_airbnb_train, mtry = 14,num.trees = 450,importance = "impurity")
+```
+
+```{r}
+#Extract feature importance from random forest
+library(ranger)
+tree_mod$variable.importance[order(tree_mod$variable.importance)]
+```
+
+```{r}
+#Extract OOB Prediction error
+sqrt(tree_mod$prediction.error)
+```
+
+```{r}
+#Validation error
+pred = predict(tree_mod, Full_airbnb_test)
+sqrt(mean((exp(pred$predictions) - exp(Full_airbnb_test$log_price))^2))
+mean(abs((exp(pred$predictions) - exp(Full_airbnb_test$log_price))))
+```
+
+
+```{r}
+#Tune nrounds for XGBoost
+library(xgboost)
+xgtree = xgb.cv(data = train_set, label = Full_airbnb_train$log_price, 
+ nround=100, 
+ eval_metric = "rmse",
+ objective = "reg:squarederror",
+ nfold = 10)
+```
+
+```{r}
+#Pick appropriate nrounds
+plot(xgtree$evaluation_log$iter,xgtree$evaluation_log$test_rmse_mean)
+xgtree$evaluation_log[which.min(xgtree$evaluation_log$test_rmse_mean),]
+```
+
+```{r}
+#Tune learning rate for XGBoost
+frames = data.frame()
+for(eta in 0.3^seq(1,10,1)){
+  xgtree = xgb.cv(data = train_set, label = Full_airbnb_train$log_price, 
+  nround=58, 
+  eta = eta,
+  eval_metric = "rmse",
+  objective = "reg:squarederror",
+  nfold = 10)
+  frames = rbind(frames,xgtree$evaluation_log[which.min(xgtree$evaluation_log$test_rmse_mean),])
+}
+
+plot(0.3^seq(1,10,1),frames$test_rmse_mean)
+```
+
+```{r}
+#Fit final tree
+xgtree = xgboost::xgboost(data = train_set, label = Full_airbnb_train$log_price, 
+ eta = 0.1,
+ max_depth = 15, 
+ nround=58, 
+ subsample = 0.5,
+ colsample_bytree = 0.5,
+ seed = 1,
+ eval_metric = "rmse",
+ objective = "reg:squarederror",
+ nthread = 3)
+```
+
+```{r}
+#Validation Error
+pred3 = predict(xgtree, model.matrix(log_price~.-neighbourhood+dist_to_center*city,Full_airbnb_test))
+sqrt(mean((exp(pred3) - exp(Full_airbnb_test$log_price))^2))
+mean(abs((exp(pred3) - exp(Full_airbnb_test$log_price))))
+```
+
+```{r}
+#Feature importance by Boosting tree
+xgb.importance(model = xgtree)
+```
+
+
+```{r}
+#Prepare for NN
+x_train <- as.matrix(sapply(Full_airbnb_train %>% select(-log_price),function(x) as.integer(x)))
+x_test <- as.matrix(sapply(Full_airbnb_test %>% select(-log_price),function(x) as.integer(x)))
+
+y_train <- exp(Full_airbnb_train$log_price)
+y_test <- exp(Full_airbnb_test$log_price)
+
+
+# # Normalize training data
+# x_train <- scale(x_train) 
+# # Use means and standard deviations from training set to normalize test set
+# col_means_train <- attr(x_train, "scaled:center") 
+# col_stddevs_train <- attr(x_train, "scaled:scale")
+# x_test <- scale(x_test, center = col_means_train, scale = col_stddevs_train)
+```
+
+```{r}
+#Visualize basic neural net
+simple_net <- data.frame(Y = y_train[1:500], 'Var' = x_train[1:500, 1:20])
+summary(simple_net)
+plot(neuralnet::neuralnet(Y~., data = simple_net, hidden = 4), rep = "best")
+```
+
+```{r}
+#Neural Network tuning and fitting
+library(keras)
+#tensorflow::install_tensorflow()
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 20, kernel_initializer = "normal",activation = "relu", input_shape = c(28)) %>%
+  layer_dense(units = 25, activation = "relu", input_shape = c(28)) %>%
+  layer_dense(units = 1, activation = "linear")
+
+model %>% compile(
+  optimizer = "adam",
+  loss = "mse",
+  metrics = c("mean_absolute_error")
+)
+
+#set.seed(471)
+val_indices <- sample(x = nrow(x_train),10000)
+x_val <- x_train[val_indices,]
+partial_x_train <- x_train[-val_indices,]
+
+y_val <- y_train[val_indices]
+partial_y_train <- y_train[-val_indices]
+fit1 <- model %>% fit(
+  partial_x_train,
+  partial_y_train,
+  epochs = 20,
+  validation_data = list(x_val, y_val),
+  batch_size = 256)
+
+plot(fit1) 
+
+fit1$metrics
+
+model %>% predict(x_test)
+
+results <- model %>% evaluate(x_test, y_test) 
+
+results$mean_absolute_error
+sqrt(results$loss)
+```
+
+```{r}
+#Predict holdout usinbg RF and visualize impact
+holdout = predict(tree_mod,Holdouts)
+Holdouts$predicted = holdout$prediction
+Holdouts$num_review = Airbnb_data_ohe$number_of_reviews[Airbnb_data_ohe$number_of_reviews < 3]
+Holdouts %>% group_by(num_review) %>% summarize(mean(exp(predicted)),mean(exp(log_price)), count =n())
+```
+ 
